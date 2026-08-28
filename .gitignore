@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+.streamlit/secrets.toml
+
+data/
+cache/
+logs/
+
+*.zip
+
+output/*.xlsx
+output/*.parquet
