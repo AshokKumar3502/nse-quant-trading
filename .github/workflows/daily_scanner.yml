@@ -1,0 +1,37 @@
+name: Daily NSE Scanner
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 13 * * 1-5' # 18:30 IST
+permissions:
+  contents: write
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run scanner
+        run: python stock_scanner.py --refresh
+      - name: Verify six reports
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          names=['all_scores.csv','next_day_candidates.csv','swing_candidates.csv','historical_setup_stats.csv','position_selection.csv','high_priority_overlap.csv']
+          missing=[x for x in names if not (Path('output')/x).exists()]
+          if missing: raise SystemExit('Missing reports: '+', '.join(missing))
+          print('Six reports verified')
+          PY
+      - name: Commit reports
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add output/*.csv output/*.xlsx || true
+          git diff --cached --quiet || git commit -m 'Daily scanner report update'
+          git push || true

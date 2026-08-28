@@ -11,3 +11,4 @@ logs/
 
 output/*.xlsx
 output/*.parquet
+.env
