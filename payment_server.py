@@ -95,6 +95,8 @@ def health():
 # ============================================================
 
 def get_authenticated_user(request: Request):
+    
+        
 
     authorization = request.headers.get("Authorization")
 
@@ -115,6 +117,7 @@ def get_authenticated_user(request: Request):
         "",
         1
     ).strip()
+    
 
     if not access_token:
         raise HTTPException(
@@ -123,10 +126,11 @@ def get_authenticated_user(request: Request):
         )
 
     try:
-
+        
         user_response = supabase.auth.get_user(
             access_token
         )
+        
 
         user = getattr(
             user_response,
@@ -227,14 +231,14 @@ async def create_subscription(request: Request):
     # --------------------------------------------------------
 
     try:
-
+        
         subscription = (
             razorpay_client
             .subscription
             .create(
                 {
                     "plan_id": RAZORPAY_PLAN_ID,
-                    "total_count": 12,
+                    "total_count": 1,
                     "quantity": 1,
                     "customer_notify": 1
                 }
@@ -250,6 +254,7 @@ async def create_subscription(request: Request):
 
 
     subscription_id = subscription["id"]
+    
 
 
     # --------------------------------------------------------
@@ -385,7 +390,7 @@ async def razorpay_webhook(request: Request):
 
         await process_subscription_event(
             event,
-            "authenticated"
+            "active"
         )
 
     elif event_name == "subscription.activated":
