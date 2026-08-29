@@ -22,10 +22,7 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 RAZORPAY_PLAN_ID = os.getenv("RAZORPAY_PLAN_ID")
-
-RAZORPAY_WEBHOOK_SECRET = os.getenv(
-    "RAZORPAY_WEBHOOK_SECRET"
-)
+RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
 
 
 # ============================================================
@@ -77,7 +74,7 @@ razorpay_client = razorpay.Client(
 
 app = FastAPI(
     title="NSE Quant Trading Payment API",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 
@@ -87,11 +84,73 @@ app = FastAPI(
 
 @app.get("/health")
 def health():
-
     return {
         "status": "ok",
         "service": "nse-quant-payment-api"
     }
+
+
+# ============================================================
+# AUTHENTICATE SUPABASE USER
+# ============================================================
+
+def get_authenticated_user(request: Request):
+
+    authorization = request.headers.get("Authorization")
+
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization header is required"
+        )
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Authorization header"
+        )
+
+    access_token = authorization.replace(
+        "Bearer ",
+        "",
+        1
+    ).strip()
+
+    if not access_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Access token is missing"
+        )
+
+    try:
+
+        user_response = supabase.auth.get_user(
+            access_token
+        )
+
+        user = getattr(
+            user_response,
+            "user",
+            None
+        )
+
+        if not user:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or expired access token"
+            )
+
+        return user
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=401,
+            detail=f"Authentication failed: {exc}"
+        )
 
 
 # ============================================================
@@ -101,43 +160,16 @@ def health():
 @app.post("/create-subscription")
 async def create_subscription(request: Request):
 
-    body = await request.json()
-
-    user_id = body.get("user_id")
-
-    if not user_id:
-        raise HTTPException(
-            status_code=400,
-            detail="user_id is required"
-        )
-
     # --------------------------------------------------------
-    # Verify that the Supabase user exists
+    # IMPORTANT:
+    # We DO NOT accept user_id from the request body.
+    #
+    # The user_id comes from the verified Supabase JWT.
     # --------------------------------------------------------
 
-    try:
+    user = get_authenticated_user(request)
 
-        user_response = (
-            supabase
-            .auth.admin
-            .get_user_by_id(user_id)
-        )
-
-        if not user_response:
-            raise HTTPException(
-                status_code=404,
-                detail="User not found"
-            )
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unable to verify user: {exc}"
-        )
+    user_id = user.id
 
 
     # --------------------------------------------------------
@@ -159,7 +191,9 @@ async def create_subscription(request: Request):
 
             current = existing.data[0]
 
-            if current.get("status") in [
+            current_status = current.get("status")
+
+            if current_status in [
                 "active",
                 "authenticated",
                 "pending"
@@ -172,15 +206,19 @@ async def create_subscription(request: Request):
                         current.get(
                             "razorpay_subscription_id"
                         ),
-                    "status":
-                        current.get("status")
+                    "status": current_status,
+                    "amount": 100,
+                    "currency": "INR"
                 }
 
     except Exception as exc:
 
         raise HTTPException(
             status_code=500,
-            detail=f"Subscription lookup failed: {exc}"
+            detail=(
+                "Subscription lookup failed: "
+                f"{exc}"
+            )
         )
 
 
@@ -215,41 +253,48 @@ async def create_subscription(request: Request):
 
 
     # --------------------------------------------------------
-    # Store subscription in Supabase
+    # Save subscription to Supabase
     # --------------------------------------------------------
+
+    record = {
+        "user_id": user_id,
+        "status": subscription.get(
+            "status",
+            "created"
+        ),
+        "plan_name": "NSE Quant Trading Monthly",
+        "amount": 100,
+        "razorpay_subscription_id":
+            subscription_id,
+        "updated_at":
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+    }
+
 
     try:
 
-        record = {
-            "user_id": user_id,
-            "status": subscription.get(
-                "status",
-                "created"
-            ),
-            "plan_name": "NSE Quant Trading Monthly",
-            "amount": 100,
-            "razorpay_subscription_id":
-                subscription_id
-        }
+        # Because user_id has a unique index,
+        # upsert safely handles an existing inactive row.
 
         (
             supabase
             .table("subscriptions")
-            .insert(record)
+            .upsert(
+                record,
+                on_conflict="user_id"
+            )
             .execute()
         )
 
     except Exception as exc:
 
-        # ----------------------------------------------------
-        # If DB insertion fails, don't silently continue.
-        # ----------------------------------------------------
-
         raise HTTPException(
             status_code=500,
             detail=(
-                "Subscription was created in Razorpay "
-                "but could not be stored in Supabase: "
+                "Razorpay subscription was created "
+                "but Supabase could not store it: "
                 f"{exc}"
             )
         )
@@ -257,6 +302,7 @@ async def create_subscription(request: Request):
 
     return {
         "success": True,
+        "existing": False,
         "subscription_id": subscription_id,
         "plan_id": RAZORPAY_PLAN_ID,
         "status": subscription.get(
@@ -290,7 +336,7 @@ async def razorpay_webhook(request: Request):
 
 
     # --------------------------------------------------------
-    # Verify webhook signature
+    # Verify Razorpay webhook signature
     # --------------------------------------------------------
 
     expected_signature = hmac.new(
@@ -331,9 +377,9 @@ async def razorpay_webhook(request: Request):
     )
 
 
-    # ========================================================
-    # SUBSCRIPTION AUTHENTICATED
-    # ========================================================
+    # --------------------------------------------------------
+    # Subscription events
+    # --------------------------------------------------------
 
     if event_name == "subscription.authenticated":
 
@@ -342,22 +388,12 @@ async def razorpay_webhook(request: Request):
             "authenticated"
         )
 
-
-    # ========================================================
-    # SUBSCRIPTION ACTIVATED
-    # ========================================================
-
     elif event_name == "subscription.activated":
 
         await process_subscription_event(
             event,
             "active"
         )
-
-
-    # ========================================================
-    # SUBSCRIPTION CHARGED
-    # ========================================================
 
     elif event_name == "subscription.charged":
 
@@ -366,11 +402,6 @@ async def razorpay_webhook(request: Request):
             "active"
         )
 
-
-    # ========================================================
-    # SUBSCRIPTION CANCELLED
-    # ========================================================
-
     elif event_name == "subscription.cancelled":
 
         await process_subscription_event(
@@ -378,22 +409,12 @@ async def razorpay_webhook(request: Request):
             "cancelled"
         )
 
-
-    # ========================================================
-    # SUBSCRIPTION COMPLETED
-    # ========================================================
-
     elif event_name == "subscription.completed":
 
         await process_subscription_event(
             event,
             "completed"
         )
-
-
-    # ========================================================
-    # PAYMENT FAILED
-    # ========================================================
 
     elif event_name == "subscription.pending":
 
@@ -423,6 +444,11 @@ async def process_subscription_event(
         {}
     )
 
+
+    # --------------------------------------------------------
+    # Subscription entity
+    # --------------------------------------------------------
+
     subscription_entity = (
         payload
         .get("subscription", {})
@@ -439,7 +465,7 @@ async def process_subscription_event(
 
 
     # --------------------------------------------------------
-    # Find our user
+    # Find subscription in our database
     # --------------------------------------------------------
 
     result = (
@@ -460,6 +486,11 @@ async def process_subscription_event(
 
     existing = result.data[0]
 
+
+    # --------------------------------------------------------
+    # Update status
+    # --------------------------------------------------------
+
     update_data = {
         "status": new_status,
         "updated_at":
@@ -470,7 +501,7 @@ async def process_subscription_event(
 
 
     # --------------------------------------------------------
-    # Extract payment information
+    # Payment entity
     # --------------------------------------------------------
 
     payment_entity = (
@@ -491,7 +522,7 @@ async def process_subscription_event(
 
 
     # --------------------------------------------------------
-    # Start date
+    # Subscription start date
     # --------------------------------------------------------
 
     start_at = subscription_entity.get(
@@ -514,7 +545,7 @@ async def process_subscription_event(
 
 
     # --------------------------------------------------------
-    # End date
+    # Subscription end date
     # --------------------------------------------------------
 
     end_at = subscription_entity.get(
