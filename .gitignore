@@ -12,3 +12,6 @@ logs/
 output/*.xlsx
 output/*.parquet
 .env
+nse_quant_react/node_modules/
+nse_quant_react/dist/
+nse_quant_react/dist/
