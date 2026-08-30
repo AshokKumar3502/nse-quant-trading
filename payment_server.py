@@ -3,31 +3,24 @@ import json
 import hmac
 import hashlib
 from datetime import datetime, timezone
+from pathlib import Path
 
+import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 import razorpay
-
-
-# ============================================================
-# ENVIRONMENT
-# ============================================================
 
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 RAZORPAY_PLAN_ID = os.getenv("RAZORPAY_PLAN_ID")
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
-
-
-# ============================================================
-# VALIDATE CONFIGURATION
-# ============================================================
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 required = {
     "SUPABASE_URL": SUPABASE_URL,
@@ -37,552 +30,527 @@ required = {
     "RAZORPAY_PLAN_ID": RAZORPAY_PLAN_ID,
     "RAZORPAY_WEBHOOK_SECRET": RAZORPAY_WEBHOOK_SECRET,
 }
+missing = [name for name, value in required.items() if not value]
+if missing:
+    raise RuntimeError("Missing environment variables: " + ", ".join(missing))
 
-missing = [
-    name
-    for name, value in required.items()
-    if not value
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+app = FastAPI(title="NSE Quant Trading API", version="2.0.0")
+
+# Local React + deployed frontend support.
+allowed_origins = [x.strip() for x in FRONTEND_URL.split(",") if x.strip()]
+if "http://localhost:5173" not in allowed_origins:
+    allowed_origins.append("http://localhost:5173")
+if "http://127.0.0.1:5173" not in allowed_origins:
+    allowed_origins.append("http://127.0.0.1:5173")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+OUTPUT = Path("output")
+
+REPORTS = {
+    "All Scores": "all_scores.csv",
+    "Next-Day Candidates": "next_day_candidates.csv",
+    "Swing Candidates": "swing_candidates.csv",
+    "Historical Setup Stats": "historical_setup_stats.csv",
+    "Position Selection": "position_selection.csv",
+    "High-Priority Overlap": "high_priority_overlap.csv",
+}
+
+PREMIUM_REPORTS = {
+    "Next-Day Candidates",
+    "High-Priority Overlap",
+}
+
+FREE_REPORTS = [
+    name for name in REPORTS
+    if name not in PREMIUM_REPORTS
 ]
 
-if missing:
-    raise RuntimeError(
-        "Missing environment variables: "
-        + ", ".join(missing)
-    )
+
+def read_report(name: str) -> pd.DataFrame:
+    filename = REPORTS.get(name)
+    if not filename:
+        raise HTTPException(status_code=404, detail="Unknown report")
+    path = OUTPUT / filename
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path, low_memory=False)
+        df.columns = [str(c).strip().replace("\n", " ") for c in df.columns]
+        return df
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not read report: {exc}",
+        )
 
 
-# ============================================================
-# CLIENTS
-# ============================================================
+def records(df: pd.DataFrame):
+    """
+    Convert a DataFrame to JSON-safe Python records.
 
-supabase = create_client(
-    SUPABASE_URL,
-    SUPABASE_SERVICE_KEY
-)
+    Important: `df.where(pd.notna(df), None)` alone does NOT reliably replace
+    NaN values in numeric columns because pandas keeps the column's float dtype.
+    Converting to object dtype first ensures missing values become real None
+    values, which FastAPI can serialize as JSON null.
+    """
+    if df.empty:
+        return []
 
-razorpay_client = razorpay.Client(
-    auth=(
-        RAZORPAY_KEY_ID,
-        RAZORPAY_KEY_SECRET
-    )
-)
+    clean = df.astype(object).where(pd.notna(df), None)
+
+    # Also normalize any remaining non-JSON numeric values.
+    result = []
+    for row in clean.to_dict(orient="records"):
+        safe_row = {}
+        for key, value in row.items():
+            if value is None:
+                safe_row[key] = None
+                continue
+
+            try:
+                # Handles float NaN / +/-Infinity.
+                if isinstance(value, float):
+                    if pd.isna(value) or value in (float("inf"), float("-inf")):
+                        safe_row[key] = None
+                        continue
+
+                # Convert pandas/numpy scalar values to native Python values.
+                if hasattr(value, "item"):
+                    value = value.item()
+
+                # Final NaN check after scalar conversion.
+                if isinstance(value, float) and pd.isna(value):
+                    value = None
+
+            except (TypeError, ValueError):
+                pass
+
+            safe_row[key] = value
+
+        result.append(safe_row)
+
+    return result
 
 
-# ============================================================
-# FASTAPI
-# ============================================================
+def symbol_column(df: pd.DataFrame):
+    if df.empty:
+        return None
+    candidates = [
+        "SYMBOL", "Symbol", "symbol", "STOCK", "Stock",
+        "TICKER", "Ticker", "SECURITY", "Security",
+    ]
+    for column in candidates:
+        if column in df.columns:
+            return column
+    for column in df.columns:
+        upper = str(column).upper()
+        if "SYMBOL" in upper or "TICKER" in upper:
+            return column
+    return None
 
-app = FastAPI(
-    title="NSE Quant Trading Payment API",
-    version="1.1.0"
-)
+
+def bearer_token(authorization: str | None):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty bearer token")
+    return token
 
 
-# ============================================================
-# HEALTH CHECK
-# ============================================================
+def authenticated_user(authorization: str | None):
+    token = bearer_token(authorization)
+    try:
+        result = supabase.auth.get_user(token)
+        user = getattr(result, "user", None)
+        if user is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired session")
+        return user
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Authentication failed: {exc}",
+        )
+
+
+def current_subscription(user_id: str):
+    try:
+        result = (
+            supabase.table("subscriptions")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Subscription lookup failed: {exc}",
+        )
+
+
+def subscription_is_active(subscription):
+    if not subscription:
+        return False
+    status = str(subscription.get("status", "")).lower()
+    return status in {"active", "authenticated"}
+
 
 @app.get("/health")
 def health():
+    return {"status": "ok", "service": "nse-quant-api"}
+
+
+# ------------------------- React REPORT API -------------------------
+
+@app.get("/api/reports")
+def api_reports(authorization: str | None = Header(default=None)):
+    user = authenticated_user(authorization)
+    subscription = current_subscription(user.id)
+    paid = subscription_is_active(subscription)
+
+    result = []
+    for name in REPORTS:
+        is_premium = name in PREMIUM_REPORTS
+        if is_premium and not paid:
+            result.append({
+                "name": name,
+                "premium": True,
+                "locked": True,
+                "count": None,
+                "rows": [],
+            })
+            continue
+
+        df = read_report(name)
+        result.append({
+            "name": name,
+            "premium": is_premium,
+            "locked": False,
+            "count": len(df),
+            "rows": records(df),
+        })
+
     return {
-        "status": "ok",
-        "service": "nse-quant-payment-api"
+        "authenticated": True,
+        "premium": paid,
+        "subscription": subscription,
+        "reports": result,
     }
 
 
-# ============================================================
-# AUTHENTICATE SUPABASE USER
-# ============================================================
+@app.get("/api/reports/{report_name}")
+def api_report(
+    report_name: str,
+    authorization: str | None = Header(default=None),
+):
+    user = authenticated_user(authorization)
+    name = report_name
+    if name not in REPORTS:
+        # Support URL-decoded report names and a few common aliases.
+        aliases = {
+            "all-scores": "All Scores",
+            "next-day-candidates": "Next-Day Candidates",
+            "swing-candidates": "Swing Candidates",
+            "historical-setup-stats": "Historical Setup Stats",
+            "position-selection": "Position Selection",
+            "high-priority-overlap": "High-Priority Overlap",
+        }
+        name = aliases.get(report_name.lower(), report_name)
 
-def get_authenticated_user(request: Request):
-    
-        
+    if name not in REPORTS:
+        raise HTTPException(status_code=404, detail="Unknown report")
 
-    authorization = request.headers.get("Authorization")
-
-    if not authorization:
+    subscription = current_subscription(user.id)
+    if name in PREMIUM_REPORTS and not subscription_is_active(subscription):
         raise HTTPException(
-            status_code=401,
-            detail="Authorization header is required"
+            status_code=403,
+            detail="Premium subscription required for this report",
         )
 
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid Authorization header"
-        )
-
-    access_token = authorization.replace(
-        "Bearer ",
-        "",
-        1
-    ).strip()
-    
-
-    if not access_token:
-        raise HTTPException(
-            status_code=401,
-            detail="Access token is missing"
-        )
-
-    try:
-        
-        user_response = supabase.auth.get_user(
-            access_token
-        )
-        
-
-        user = getattr(
-            user_response,
-            "user",
-            None
-        )
-
-        if not user:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid or expired access token"
-            )
-
-        return user
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=401,
-            detail=f"Authentication failed: {exc}"
-        )
+    df = read_report(name)
+    return {
+        "name": name,
+        "premium": name in PREMIUM_REPORTS,
+        "count": len(df),
+        "columns": list(df.columns),
+        "rows": records(df),
+    }
 
 
-# ============================================================
-# CREATE RAZORPAY SUBSCRIPTION
-# ============================================================
+@app.get("/api/stocks/{symbol}")
+def api_stock(
+    symbol: str,
+    authorization: str | None = Header(default=None),
+):
+    user = authenticated_user(authorization)
+    target = symbol.strip().upper()
+    if not target:
+        raise HTTPException(status_code=400, detail="Stock symbol is required")
+
+    found = []
+    overview = {}
+
+    for name in FREE_REPORTS:
+        df = read_report(name)
+        sc = symbol_column(df)
+        if not sc or df.empty:
+            continue
+
+        mask = df[sc].astype(str).str.strip().str.upper().eq(target)
+        matches = df.loc[mask]
+        if matches.empty:
+            continue
+
+        row = matches.iloc[0]
+        for key in [
+            "CMP", "PRICE", "LTP", "CURRENT_PRICE",
+            "BIAS", "SIGNAL", "CONFIDENCE", "SCORE",
+            "SWING_SCORE", "POSITION_SCORE", "HISTORICAL_SCORE",
+            "TREND", "TRADE_MODE", "PRIMARY_DRIVER", "INVALIDATION",
+        ]:
+            if key in row.index and key not in overview:
+                value = row[key]
+                overview[key] = None if pd.isna(value) else value
+
+        found.append({
+            "report": name,
+            "premium": False,
+            "count": len(matches),
+            "rows": records(matches),
+        })
+
+    # Premium report metadata is visible only to paid users.
+    subscription = current_subscription(user.id)
+    paid = subscription_is_active(subscription)
+
+    for name in PREMIUM_REPORTS:
+        df = read_report(name)
+        sc = symbol_column(df)
+        if not sc or df.empty:
+            continue
+        mask = df[sc].astype(str).str.strip().str.upper().eq(target)
+        matches = df.loc[mask]
+        if matches.empty:
+            continue
+        found.append({
+            "report": name,
+            "premium": True,
+            "locked": not paid,
+            "count": len(matches) if paid else None,
+            "rows": records(matches) if paid else [],
+        })
+
+    return {
+        "symbol": target,
+        "signal": overview.get("SIGNAL") or overview.get("BIAS"),
+        "overview": overview,
+        "reports": found,
+        "premium": paid,
+    }
+
+
+@app.get("/api/subscription")
+def api_subscription(authorization: str | None = Header(default=None)):
+    user = authenticated_user(authorization)
+    subscription = current_subscription(user.id)
+    return {
+        "authenticated": True,
+        "active": subscription_is_active(subscription),
+        "subscription": subscription,
+    }
+
+
+# ------------------------- EXISTING PAYMENT LOGIC -------------------------
 
 @app.post("/create-subscription")
 async def create_subscription(request: Request):
+    body = await request.json()
+    user_id = body.get("user_id")
 
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # We DO NOT accept user_id from the request body.
-    #
-    # The user_id comes from the verified Supabase JWT.
-    # --------------------------------------------------------
-
-    user = get_authenticated_user(request)
-
-    user_id = user.id
-
-
-    # --------------------------------------------------------
-    # Check existing subscription
-    # --------------------------------------------------------
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
 
     try:
+        user_response = supabase.auth.admin.get_user_by_id(user_id)
+        if not user_response:
+            raise HTTPException(status_code=404, detail="User not found")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to verify user: {exc}",
+        )
 
+    try:
         existing = (
-            supabase
-            .table("subscriptions")
+            supabase.table("subscriptions")
             .select("*")
             .eq("user_id", user_id)
             .limit(1)
             .execute()
         )
-
         if existing.data:
-
             current = existing.data[0]
-
-            current_status = current.get("status")
-
-            if current_status in [
-                "active",
-                "authenticated",
-                "pending"
-            ]:
-
+            if current.get("status") in ["active", "authenticated", "pending"]:
                 return {
                     "success": True,
                     "existing": True,
-                    "subscription_id":
-                        current.get(
-                            "razorpay_subscription_id"
-                        ),
-                    "status": current_status,
-                    "amount": 100,
-                    "currency": "INR"
+                    "subscription_id": current.get("razorpay_subscription_id"),
+                    "status": current.get("status"),
                 }
-
     except Exception as exc:
-
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Subscription lookup failed: "
-                f"{exc}"
-            )
+            detail=f"Subscription lookup failed: {exc}",
         )
-
-
-    # --------------------------------------------------------
-    # Create Razorpay subscription
-    # --------------------------------------------------------
 
     try:
-        
-        subscription = (
-            razorpay_client
-            .subscription
-            .create(
-                {
-                    "plan_id": RAZORPAY_PLAN_ID,
-                    "total_count": 1,
-                    "quantity": 1,
-                    "customer_notify": 1
-                }
-            )
-        )
-
+        subscription = razorpay_client.subscription.create({
+            "plan_id": RAZORPAY_PLAN_ID,
+            "total_count": 12,
+            "quantity": 1,
+            "customer_notify": 1,
+        })
     except Exception as exc:
-
-        raise HTTPException(
-            status_code=502,
-            detail=f"Razorpay error: {exc}"
-        )
-
+        raise HTTPException(status_code=502, detail=f"Razorpay error: {exc}")
 
     subscription_id = subscription["id"]
-    
-
-
-    # --------------------------------------------------------
-    # Save subscription to Supabase
-    # --------------------------------------------------------
-
-    record = {
-        "user_id": user_id,
-        "status": subscription.get(
-            "status",
-            "created"
-        ),
-        "plan_name": "NSE Quant Trading Monthly",
-        "amount": 100,
-        "razorpay_subscription_id":
-            subscription_id,
-        "updated_at":
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-    }
-
 
     try:
-
-        # Because user_id has a unique index,
-        # upsert safely handles an existing inactive row.
-
-        (
-            supabase
-            .table("subscriptions")
-            .upsert(
-                record,
-                on_conflict="user_id"
-            )
-            .execute()
-        )
-
+        record = {
+            "user_id": user_id,
+            "status": subscription.get("status", "created"),
+            "plan_name": "NSE Quant Trading Monthly",
+            "amount": 100,
+            "razorpay_subscription_id": subscription_id,
+        }
+        supabase.table("subscriptions").insert(record).execute()
     except Exception as exc:
-
         raise HTTPException(
             status_code=500,
             detail=(
-                "Razorpay subscription was created "
-                "but Supabase could not store it: "
-                f"{exc}"
-            )
+                "Subscription was created in Razorpay but could not be stored "
+                f"in Supabase: {exc}"
+            ),
         )
-
 
     return {
         "success": True,
-        "existing": False,
         "subscription_id": subscription_id,
         "plan_id": RAZORPAY_PLAN_ID,
-        "status": subscription.get(
-            "status",
-            "created"
-        ),
+        "status": subscription.get("status", "created"),
         "amount": 100,
-        "currency": "INR"
+        "currency": "INR",
     }
 
 
-# ============================================================
-# RAZORPAY WEBHOOK
-# ============================================================
-
 @app.post("/razorpay-webhook")
 async def razorpay_webhook(request: Request):
-
     payload = await request.body()
-
-    received_signature = request.headers.get(
-        "X-Razorpay-Signature"
-    )
+    received_signature = request.headers.get("X-Razorpay-Signature")
 
     if not received_signature:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Missing Razorpay signature"
-        )
-
-
-    # --------------------------------------------------------
-    # Verify Razorpay webhook signature
-    # --------------------------------------------------------
+        raise HTTPException(status_code=400, detail="Missing Razorpay signature")
 
     expected_signature = hmac.new(
         RAZORPAY_WEBHOOK_SECRET.encode(),
         payload,
-        hashlib.sha256
+        hashlib.sha256,
     ).hexdigest()
 
-
-    if not hmac.compare_digest(
-        expected_signature,
-        received_signature
-    ):
-
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid webhook signature"
-        )
-
+    if not hmac.compare_digest(expected_signature, received_signature):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
     try:
-
-        event = json.loads(
-            payload.decode("utf-8")
-        )
-
+        event = json.loads(payload.decode("utf-8"))
     except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid JSON payload"
-        )
-
-
-    event_name = event.get(
-        "event",
-        ""
-    )
-
-
-    # --------------------------------------------------------
-    # Subscription events
-    # --------------------------------------------------------
+    event_name = event.get("event", "")
 
     if event_name == "subscription.authenticated":
-
-        await process_subscription_event(
-            event,
-            "active"
-        )
-
+        await process_subscription_event(event, "authenticated")
     elif event_name == "subscription.activated":
-
-        await process_subscription_event(
-            event,
-            "active"
-        )
-
+        await process_subscription_event(event, "active")
     elif event_name == "subscription.charged":
-
-        await process_subscription_event(
-            event,
-            "active"
-        )
-
+        await process_subscription_event(event, "active")
     elif event_name == "subscription.cancelled":
-
-        await process_subscription_event(
-            event,
-            "cancelled"
-        )
-
+        await process_subscription_event(event, "cancelled")
     elif event_name == "subscription.completed":
-
-        await process_subscription_event(
-            event,
-            "completed"
-        )
-
+        await process_subscription_event(event, "completed")
     elif event_name == "subscription.pending":
+        await process_subscription_event(event, "pending")
 
-        await process_subscription_event(
-            event,
-            "pending"
-        )
+    return {"received": True, "event": event_name}
 
 
-    return {
-        "received": True,
-        "event": event_name
-    }
-
-
-# ============================================================
-# PROCESS SUBSCRIPTION EVENT
-# ============================================================
-
-async def process_subscription_event(
-    event,
-    new_status
-):
-
-    payload = event.get(
-        "payload",
-        {}
-    )
-
-
-    # --------------------------------------------------------
-    # Subscription entity
-    # --------------------------------------------------------
-
+async def process_subscription_event(event, new_status):
+    payload = event.get("payload", {})
     subscription_entity = (
-        payload
-        .get("subscription", {})
-        .get("entity", {})
+        payload.get("subscription", {}).get("entity", {})
     )
-
-    subscription_id = (
-        subscription_entity
-        .get("id")
-    )
+    subscription_id = subscription_entity.get("id")
 
     if not subscription_id:
         return
 
-
-    # --------------------------------------------------------
-    # Find subscription in our database
-    # --------------------------------------------------------
-
     result = (
-        supabase
-        .table("subscriptions")
+        supabase.table("subscriptions")
         .select("*")
-        .eq(
-            "razorpay_subscription_id",
-            subscription_id
-        )
+        .eq("razorpay_subscription_id", subscription_id)
         .limit(1)
         .execute()
     )
-
     if not result.data:
         return
 
-
     existing = result.data[0]
-
-
-    # --------------------------------------------------------
-    # Update status
-    # --------------------------------------------------------
-
     update_data = {
         "status": new_status,
-        "updated_at":
-            datetime.now(
-                timezone.utc
-            ).isoformat()
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-
-    # --------------------------------------------------------
-    # Payment entity
-    # --------------------------------------------------------
-
-    payment_entity = (
-        payload
-        .get("payment", {})
-        .get("entity", {})
-    )
-
-    payment_id = payment_entity.get(
-        "id"
-    )
-
+    payment_entity = payload.get("payment", {}).get("entity", {})
+    payment_id = payment_entity.get("id")
     if payment_id:
+        update_data["razorpay_payment_id"] = payment_id
 
-        update_data[
-            "razorpay_payment_id"
-        ] = payment_id
-
-
-    # --------------------------------------------------------
-    # Subscription start date
-    # --------------------------------------------------------
-
-    start_at = subscription_entity.get(
-        "start_at"
-    )
-
+    start_at = subscription_entity.get("start_at")
     if start_at:
-
         try:
-
-            update_data["start_date"] = (
-                datetime.fromtimestamp(
-                    int(start_at),
-                    tz=timezone.utc
-                ).isoformat()
-            )
-
+            update_data["start_date"] = datetime.fromtimestamp(
+                int(start_at), tz=timezone.utc
+            ).isoformat()
         except Exception:
             pass
 
-
-    # --------------------------------------------------------
-    # Subscription end date
-    # --------------------------------------------------------
-
-    end_at = subscription_entity.get(
-        "end_at"
-    )
-
+    end_at = subscription_entity.get("end_at")
     if end_at:
-
         try:
-
-            update_data["end_date"] = (
-                datetime.fromtimestamp(
-                    int(end_at),
-                    tz=timezone.utc
-                ).isoformat()
-            )
-
+            update_data["end_date"] = datetime.fromtimestamp(
+                int(end_at), tz=timezone.utc
+            ).isoformat()
         except Exception:
             pass
 
-
-    # --------------------------------------------------------
-    # Update Supabase
-    # --------------------------------------------------------
-
-    (
-        supabase
-        .table("subscriptions")
-        .update(update_data)
-        .eq(
-            "id",
-            existing["id"]
-        )
-        .execute()
-    )
+    supabase.table("subscriptions").update(update_data).eq(
+        "id", existing["id"]
+    ).execute()
